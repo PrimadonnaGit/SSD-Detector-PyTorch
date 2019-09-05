@@ -1,9 +1,9 @@
 import torch
-from torchvision.utils.data import Dataset
+from torch.utils.data import Dataset
 import json
 import os
 from PIL import Image
-from .utils import transform
+from utils import transform
 
 class PascalVOCDataset(Dataset):
     """
@@ -33,7 +33,7 @@ class PascalVOCDataset(Dataset):
     def __getitem__(self, i):
         # Read image
         image = Image.open(self.images[i], mode='r')
-        image = Image.convert('RGB')
+        image = image.convert('RGB')
 
         # Read objects in this image (bounding boxes, labels, difficulties)
         objects = self.objects[i]

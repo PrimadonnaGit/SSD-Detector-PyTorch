@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import torchvision.transforms.functional as FT
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 ## Label map
 voc_labels = ('aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow', 'diningtable',
@@ -112,13 +113,14 @@ def create_data_lists(voc07_path, voc12_path, output_folder):
 
     # Find IDs of images in validation data
     with open(os.path.join(voc07_path, 'ImageSets/Main/test.txt')) as f:
-        ids = f.read.splitlines()
+        ids = f.read().splitlines()
 
     for id in ids:
         # Parse annotation's XML files
         objects = parse_annotation(os.path.join(voc07_path, 'Annotations', id + '.xml'))
         if len(objects) == 0:
             continue
+
         test_objects.append(objects)
         n_objects += len(objects)
         test_images.append(os.path.join(voc07_path, 'JPEGImages', id + '.jpg'))
@@ -182,6 +184,36 @@ def photometric_distort(image):
 
     return new_image
 
+def xy_to_cxcy(xy):
+    """
+    Convert bounding boxes from boundary coordinates (x_min, y_min, x_max, y_max) to center-size coordinates (c_x, c_y, w, h)
+
+    :param xy: bounding boxes in boundary coordinates, a tensor of size (n_boxes, 4)
+    :return: bounding boxes in center-size coordinates, a tensor of size (n_boxes, 4)
+    """
+
+    return torch.cat([(xy[:, 2:] + xy[:, :2]) / 2, # c_x, c_y
+                      xy[:, 2:] - xy[:, :2]], 1) # w, h
+
+def cxcy_to_gcxgcy(cxcy, priors_cxcy):
+    """
+    Encode bounding boxes (that are in center-size form) w.r.t. the corresponding prior boxes (that are in center-size form)
+
+    For the center coordinates, find the offset with respect to the prior box, and scale by the size of the prior box.
+    For the size coordinates, scale by the size of the prior box, and convert to the log-space.
+
+    In the model, we are predicting bounding box coordinates in this encoded form.
+
+    :param cxcy: bounding boxes in center-size coordinates, a tensor of size (n_priors, 4)
+    :param priors_cxcy: prior boxes with respect to which the encoding must be performed, a tensor of size (n_priors, 4)
+    :return: encoded bounding boxes, a tensor of size (n_priors, 4)
+    """
+
+    # The 10 and 5 below are referred to as 'variance' in the repo, completely empirical
+    # They are for some sort of numerical conditioning, for 'scaling the localization gradient'
+    return torch.cat([(cxcy[:, :2] - priors_cxcy[:, :2]) / (priors_cxcy[:, 2:] / 10), # g_c_x, g_c_y
+                      torch.log(cxcy[:, 2:] / priors_cxcy[:, 2:]) * 5], 1) # g_w, g_h
+
 def cxcy_to_xy(cxcy):
     """
     Convert bounding boxes from center-size coordinates (c_x, c_y, w, h) to boundary coordinates (x_min, y_min, x_max, y_max)
@@ -238,7 +270,7 @@ def expand(image, boxes, filler):
     right = left + original_w
     top = random.randint(0, new_h - original_h)
     bottom = top + original_h
-    new_image[:, top:bottom, left::right] = image
+    new_image[:, top:bottom, left:right] = image
 
     # Adjust bounding boxes coordinates accordingly
     new_boxes = boxes + torch.FloatTensor([left, top, left, top]).unsqueeze(0) # (n_objects, 4)
@@ -355,7 +387,7 @@ def random_crop(image, boxes, labels, difficulties):
                 continue
 
             # Discard bounding boxes that don't meet this criterion
-            new_boxes = boxes[centers_in_crop, :1]
+            new_boxes = boxes[centers_in_crop, :]
             new_labels = labels[centers_in_crop]
             new_difficulties = difficulties[centers_in_crop]
 
@@ -445,8 +477,8 @@ def transform(image, boxes, labels, difficulties, split):
 
         # Expand image (zoom out) with a 50% chance - helpful for training detection of small objects
         # Fill surrounding space with the mean of ImageNet data that our base VGG was trained on
-        if random.random < 0.5:
-            new_image, new_boxes = expand(new_image, filler=mean)
+        if random.random() < 0.5:
+            new_image, new_boxes = expand(new_image, boxes, filler=mean)
 
         # Randomly crop image (zoom in)
         new_image, new_boxes, new_labels, new_difficulties = random_crop(new_image, new_boxes, new_labels, new_difficulties)
@@ -469,6 +501,56 @@ def transform(image, boxes, labels, difficulties, split):
 
     return new_image, new_boxes, new_labels, new_difficulties
 
+def save_checkpoint(epoch, epochs_since_improvement, model, optimizer, loss, best_loss, is_best):
+    """
+    Save model checkpoint.
+    :param epoch: epoch number
+    :param epochs_since_improvement: number of epochs since last improvement
+    :param model: model
+    :param optimizer: optimizer
+    :param loss: validation loss in this epoch
+    :param best_loss: best validation loss achieved so far (not necessarily in this checkpoint)
+    :param is_best: is this checkpoint the best so far?
+    """
+    state = {'epoch': epoch,
+             'epochs_since_improvement': epochs_since_improvement,
+             'loss': loss,
+             'best_loss': best_loss,
+             'model': model,
+             'optimizer': optimizer}
+    filename = 'checkpoint_ssd300.pth.tar'
+    torch.save(state, filename)
+    # If this checkpoint is the best so far, store a copy so it doesn't get overwritten by a worse checkpoint
+    if is_best:
+        torch.save(state, 'BEST_' + filename)
 
+class AverageMeter(object):
+    """
+    Keeps track of most recent, average, sum, and count of a metric.
+    """
 
+    def __init__(self):
+        self.reset()
 
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def clip_gradient(optimizer, grad_clip):
+    """
+    Clips gradients computed during backpropagation to avoid explosion of gradients.
+    :param optimizer: optimizer with the gradients to be clipped
+    :param grad_clip: clip value
+    """
+    for group in optimizer.param_groups:
+        for param in group['params']:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
